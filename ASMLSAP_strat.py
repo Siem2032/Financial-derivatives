@@ -165,32 +165,32 @@ while True:
                     order_type="limit"
                     )
 
-            elif ASML_DUAL.asks[0].price < ASML.bids[0].price - epsilon:
-                print("Opportunity: Buy ASML_DUAL @ ask, Sell ASML @ bid")
+        elif ASML_DUAL.asks[0].price < ASML.bids[0].price - epsilon:
+            print("Opportunity: Buy ASML_DUAL @ ask, Sell ASML @ bid")
                         # Buy ASML_DUAL
-                side = "bid"
-                price = ASML_DUAL.asks[0].price
-                if not trade_would_breach_position_limit("ASML_DUAL", volume, side):
-                    print(f"Inserting {side} for ASML_DUAL: {volume} lot(s) at price {price:.2f}.")
-                    exchange.insert_order(
-                            instrument_id="ASML_DUAL",
-                            price=price,
-                            volume=volume,
-                            side=side,
-                            order_type="limit"
-                        )
-                        # Sell ASML
-                side = "ask"
-                price = ASML.bids[0].price
-                if not trade_would_breach_position_limit("ASML", volume, side):
-                    print(f"Inserting {side} for ASML: {volume} lot(s) at price {price:.2f}.")
-                    exchange.insert_order(
-                            instrument_id="ASML",
-                            price=price,
-                            volume=volume,
-                            side=side,
-                            order_type="limit"
-                        )
+            side = "bid"
+            price = ASML_DUAL.asks[0].price
+            if not trade_would_breach_position_limit("ASML_DUAL", volume, side):
+                print(f"Inserting {side} for ASML_DUAL: {volume} lot(s) at price {price:.2f}.")
+                exchange.insert_order(
+                        instrument_id="ASML_DUAL",
+                        price=price,
+                        volume=volume,
+                        side=side,
+                        order_type="limit"
+                    )
+                    # Sell ASML
+            side = "ask"
+            price = ASML.bids[0].price
+            if not trade_would_breach_position_limit("ASML", volume, side):
+                print(f"Inserting {side} for ASML: {volume} lot(s) at price {price:.2f}.")
+                exchange.insert_order(
+                        instrument_id="ASML",
+                        price=price,
+                        volume=volume,
+                        side=side,
+                        order_type="limit"
+                    )
         else:
             print("No arbitrage opportunity.")
 
