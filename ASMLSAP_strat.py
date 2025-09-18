@@ -10,7 +10,7 @@ logging.getLogger("client").setLevel("ERROR")
 INSTRUMENT_IDS = ["SAP", "SAP_DUAL","ASML","ASML_DUAL"]
 
 epsilon = 0.0001  # ignore tiny differences
-volume=100
+volume=20
 
 def trade_would_breach_position_limit(instrument_id, volume, side, position_limit=100):
     positions = exchange.get_positions()
@@ -68,7 +68,7 @@ while True:
         SAP_DUAL = order_books["SAP_DUAL"]
         ASML = order_books["ASML"]
         ASML_DUAL = order_books["ASML_DUAL"]
-        
+
         print()
         print(f"SAP      top bid: {SAP.bids[0].price:.2f}, top ask: {SAP.asks[0].price:.2f}")
         print(f"SAP_DUAL top bid: {SAP_DUAL.bids[0].price:.2f}, top ask: {SAP_DUAL.asks[0].price:.2f}")
@@ -79,6 +79,10 @@ while True:
             print("Opportunity: Buy SAP @ ask, Sell SAP_DUAL @ bid")
             side = "bid"
             price = SAP.asks[0].price
+            sap_ask_vol = SAP.asks[0].volume
+            sap_dual_bid_vol = SAP_DUAL.bids[0].volume
+            
+            volume = min(sap_ask_vol, sap_dual_bid_vol, 30)
             # Buy SAP
             if not trade_would_breach_position_limit("SAP", volume, side):
                 print(f"Inserting {side} for SAP: {volume} lot(s) at price {price:.2f}.")
@@ -87,7 +91,7 @@ while True:
                         price=price,
                         volume=volume,
                         side=side,
-                        order_type="limit"
+                        order_type="ioc"
                     )
             # Sell SAP_DUAL
             side = "ask"
@@ -99,7 +103,7 @@ while True:
                     price=price,
                     volume=volume,
                     side=side,
-                    order_type="limit"
+                    order_type="ioc"
                     )
 
         elif SAP_DUAL.asks[0].price < SAP.bids[0].price - epsilon:
@@ -107,6 +111,10 @@ while True:
                      # Buy SAP_DUAL
             side = "bid"
             price = SAP_DUAL.asks[0].price
+            sap_bid_vol = SAP.bids[0].volume
+            sap_dual_ask_vol = SAP_DUAL.asks[0].volume
+            
+            volume = min(sap_bid_vol, sap_dual_ask_vol, 30)
             if not trade_would_breach_position_limit("SAP_DUAL", volume, side):
                 print(f"Inserting {side} for SAP_DUAL: {volume} lot(s) at price {price:.2f}.")
                 exchange.insert_order(
@@ -114,7 +122,7 @@ while True:
                         price=price,
                         volume=volume,
                         side=side,
-                        order_type="limit"
+                        order_type="ioc"
                     )
                     # Sell SAP
             side = "ask"
@@ -126,7 +134,7 @@ while True:
                         price=price,
                         volume=volume,
                         side=side,
-                        order_type="limit"
+                        order_type="ioc"
                     )
         else:
             print("No arbitrage opportunity.")
@@ -142,6 +150,10 @@ while True:
             print("Opportunity: Buy ASML @ ask, Sell ASML_DUAL @ bid")
             side = "bid"
             price = ASML.asks[0].price
+            ASML_ask_vol = ASML.asks[0].volume
+            ASML_dual_bid_vol = ASML_DUAL.bids[0].volume
+            
+            volume = min(ASML_ask_vol, ASML_dual_bid_vol, 30)
             # Buy ASML
             if not trade_would_breach_position_limit("ASML", volume, side):
                 print(f"Inserting {side} for ASML: {volume} lot(s) at price {price:.2f}.")
@@ -150,7 +162,7 @@ while True:
                         price=price,
                         volume=volume,
                         side=side,
-                        order_type="limit"
+                        order_type="ioc"
                     )
             # Sell ASML_DUAL
             side = "ask"
@@ -162,14 +174,18 @@ while True:
                     price=price,
                     volume=volume,
                     side=side,
-                    order_type="limit"
+                    order_type="ioc"
                     )
 
         elif ASML_DUAL.asks[0].price < ASML.bids[0].price - epsilon:
             print("Opportunity: Buy ASML_DUAL @ ask, Sell ASML @ bid")
-                        # Buy ASML_DUAL
+                    # Buy ASML_DUAL
             side = "bid"
             price = ASML_DUAL.asks[0].price
+            ASML_bid_vol = ASML.bids[0].volume
+            ASML_dual_ask_vol = ASML_DUAL.asks[0].volume
+            
+            volume = min(ASML_bid_vol, ASML_dual_ask_vol, 30)
             if not trade_would_breach_position_limit("ASML_DUAL", volume, side):
                 print(f"Inserting {side} for ASML_DUAL: {volume} lot(s) at price {price:.2f}.")
                 exchange.insert_order(
@@ -177,7 +193,7 @@ while True:
                         price=price,
                         volume=volume,
                         side=side,
-                        order_type="limit"
+                        order_type="ioc"
                     )
                     # Sell ASML
             side = "ask"
@@ -189,7 +205,7 @@ while True:
                         price=price,
                         volume=volume,
                         side=side,
-                        order_type="limit"
+                        order_type="ioc"
                     )
         else:
             print("No arbitrage opportunity.")
@@ -227,4 +243,4 @@ while True:
 
     print("\nSleeping 5 seconds before next iteration...\n")
         
-    time.sleep(10)
+    time.sleep(0.1)
