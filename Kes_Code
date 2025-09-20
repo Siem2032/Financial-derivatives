@@ -1,1 +1,112 @@
+#%%
+import datetime as dt
+import time
+import random
+import logging
+
+from optibook.synchronous_client import Exchange
+
+exchange = Exchange()
+exchange.connect()
+
+logging.getLogger("client").setLevel("ERROR")
+
+
+def trade_would_breach_position_limit(instrument_id, volume, side, position_limit=100):
+    positions = exchange.get_positions()
+    position_instrument = positions[instrument_id]
+    if volume == 0:
+        return True
+    if side == "bid":
+        return position_instrument + volume > position_limit
+    elif side == "ask":
+        return position_instrument - volume < -position_limit
+    else:
+        raise Exception(f"""Invalid side provided: {side}, expecting 'bid' or 'ask'.""")
+
+
+def print_positions_and_pnl(always_display=None):
+    positions = exchange.get_positions()
+    print("Positions:")
+    for instrument_id in positions:
+        if (
+            not always_display
+            or instrument_id in always_display
+            or positions[instrument_id] != 0
+        ):
+            print(f"  {instrument_id:20s}: {positions[instrument_id]:4.0f}")
+
+    pnl = exchange.get_pnl()
+    if pnl:
+        print(f"\nPnL: {pnl:.2f}")
+
+
+    #%%
+    tickers = ["ASML", "SAP"]
+
+    #Create a "map" (dictionary) of ticker -> ticker_dual
+    ticker_map = {ticker: f"{ticker}_DUAL" for ticker in tickers}
+
+    print(ticker_map)
+    #%%
+    print_positions_and_pnl()
+    #%%
+#%%
+while True:
+    print(f"")
+    print(f"-----------------------------------------------------------------")
+    print(f"TRADE LOOP ITERATION ENTERED AT {str(dt.datetime.now()):18s} UTC.")
+    print(f"-----------------------------------------------------------------")
+    positions = exchange.get_positions()
+    print_positions_and_pnl()
+    print(f"")
+    for key, value in ticker_map.items():
+        stock_id = key
+        stock_id_dual = value
+        print(f"Stock: {stock_id}, Stock_Dual: {stock_id_dual}")
+        print_positions_and_pnl(always_display=[stock_id, stock_id_dual])
+        print(f"")
+
+        stock_order_book = exchange.get_last_price_book(stock_id)
+        stock_dual_order_book = exchange.get_last_price_book(stock_id_dual)
+        print(stock_order_book)
+        print(stock_dual_order_book)
+    	
+        if(stock_order_book.bids and stock_dual_order_book.asks):
+            best_bid_price = stock_order_book.bids[0].price
+            best_bid_vol = stock_order_book.bids[0].volume
+            best_ask_price = stock_dual_order_book.asks[0].price
+            best_ask_vol = stock_dual_order_book.asks[0].volume
+
+            if best_bid_price > best_ask_price:
+                if not trade_would_breach_position_limit(stock_id_dual, min(best_bid_vol, best_ask_vol, 100 - positions[stock_id_dual]), "bid") and not trade_would_breach_position_limit(stock_id, min(best_bid_vol, best_ask_vol, 100 + positions[stock_id]), "ask"):
+                    print("trade done")
+                    print(min(best_bid_vol, best_ask_vol, 100 - positions[stock_id_dual]))
+                    print(min(best_bid_vol, best_ask_vol, 100 + positions[stock_id]))
+                    exchange.insert_order(stock_id_dual, price= best_ask_price, volume= min(best_bid_vol, best_ask_vol, 100 - positions[stock_id_dual]), side="bid", order_type="ioc")
+                    exchange.insert_order(stock_id, price= best_bid_price, volume= min(best_bid_vol, best_ask_vol, 100 + positions[stock_id]), side="ask", order_type="ioc")
+
+        if(stock_dual_order_book.bids and stock_order_book.asks):
+            best_bid_price = stock_dual_order_book.bids[0].price
+            best_bid_vol = stock_dual_order_book.bids[0].volume
+            best_ask_price = stock_order_book.asks[0].price
+            best_ask_vol = stock_order_book.asks[0].volume
+
+            if best_bid_price > best_ask_price:
+                if not trade_would_breach_position_limit(stock_id_dual, min(best_bid_vol, best_ask_vol, 100 + positions[stock_id_dual]), "ask") and not trade_would_breach_position_limit(stock_id, min(best_bid_vol, best_ask_vol, 100 - positions[stock_id]), "bid"):
+                    print("trade done")
+                    print(min(best_bid_vol, best_ask_vol, 100 + positions[stock_id_dual]))
+                    print(min(best_bid_vol, best_ask_vol, 100 - positions[stock_id]))
+                    exchange.insert_order(stock_id_dual, price= best_bid_price, volume= min(best_bid_vol, best_ask_vol, 100 + positions[stock_id_dual]), side="ask", order_type="ioc")
+                    exchange.insert_order(stock_id, price= best_ask_price, volume= min(best_bid_vol, best_ask_vol, 100 - positions[stock_id]), side="bid", order_type="ioc")
+
+    print(f"\nSleeping for 5 seconds.")
+    time.sleep(.1)
+
+
+# %%
+
+exchange.insert_order("ASML", price= exchange.get_last_price_book("ASML").asks[0].price, volume= 35, side="bid", order_type="ioc")
+
+# %%
 
