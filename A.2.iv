@@ -1,0 +1,113 @@
+import datetime as dt
+import time
+import logging
+import numpy as np
+
+from optibook.synchronous_client import Exchange
+
+# ===================== SETUP =====================
+exchange = Exchange()
+exchange.connect()
+logging.getLogger("client").setLevel("ERROR")
+
+# ===================== CONFIG =====================
+POSITION_LIMIT   = 100
+VOLUME_PER_TRADE = 1
+SLEEP_SECS       = 2
+RUN_MINUTES      = 60      # length of run
+QUESTION_LABEL   = "A.1.iv"
+
+STOCK_A_ID = "ASML"        # main
+STOCK_B_ID = "ASML_DUAL"   # dual
+
+# minimal tick size to stay strictly inside the spread
+TINY_TICK = 0.1
+
+# Track PnL baseline
+pnl0 = exchange.get_pnl()
+print(f"Starting PnL baseline: {pnl0:.2f}")
+
+# ===================== FILE NAME =====================
+start_time = dt.datetime.now()
+filename = f"{start_time.strftime('%Y-%m-%d-%H%M%S')}-{QUESTION_LABEL}-export.csv"
+print(f"📂 Exporting run data to: {filename}")
+
+# ===================== TRADING LOOP =====================
+loop_start = time.time()
+pnl_history = []
+
+while True:
+    now = time.time()
+    elapsed = now - loop_start
+    if elapsed > RUN_MINUTES * 60:
+        print("\n⏹️ Time limit reached, stopping trading loop.")
+        break
+
+    print("\n" + "-"*65)
+    print(f"TRADE LOOP ENTERED AT {dt.datetime.utcnow()} UTC")
+    print("-"*65)
+
+    # Fetch books
+    book_A = exchange.get_last_price_book(STOCK_A_ID)
+    book_B = exchange.get_last_price_book(STOCK_B_ID)
+
+    if not (book_A and book_A.bids and book_A.asks and book_B and book_B.bids and book_B.asks):
+        print("⚠️ One of the order books incomplete, skipping iteration.")
+        time.sleep(SLEEP_SECS)
+        continue
+
+    best_bid_A, best_ask_A = book_A.bids[0].price, book_A.asks[0].price
+    best_bid_B, best_ask_B = book_B.bids[0].price, book_B.asks[0].price
+
+    print(f"{STOCK_A_ID}: bid {best_bid_A:.2f}, ask {best_ask_A:.2f}")
+    print(f"{STOCK_B_ID}: bid {best_bid_B:.2f}, ask {best_ask_B:.2f}")
+
+    # --- Trading logic with IOC inside arbitrage spread ---
+    positions = exchange.get_positions()
+    pos_A = positions[STOCK_A_ID]
+    pos_B = positions[STOCK_B_ID]
+
+    # Case 1: dual cheap -> buy dual, sell main
+    if best_bid_A > best_ask_B:
+        if pos_B + VOLUME_PER_TRADE <= POSITION_LIMIT and pos_A - VOLUME_PER_TRADE >= -POSITION_LIMIT:
+            buy_price_dual  = best_bid_A - TINY_TICK   # will still hit best_ask_B if available
+            sell_price_main = best_bid_A              # safe bound
+            print(f"🚀 BUY {STOCK_B_ID} @ ≤{buy_price_dual:.2f}, SELL {STOCK_A_ID} @ {sell_price_main:.2f}")
+            resp1 = exchange.insert_order(STOCK_B_ID, price=buy_price_dual,
+                                          volume=VOLUME_PER_TRADE, side="bid", order_type="ioc")
+            resp2 = exchange.insert_order(STOCK_A_ID, price=sell_price_main,
+                                          volume=VOLUME_PER_TRADE, side="ask", order_type="ioc")
+            print("Trade responses:", resp1, resp2)
+
+    # Case 2: dual rich -> sell dual, buy main
+    elif best_ask_A < best_bid_B:
+        if pos_B - VOLUME_PER_TRADE >= -POSITION_LIMIT and pos_A + VOLUME_PER_TRADE <= POSITION_LIMIT:
+            sell_price_dual = best_ask_A + TINY_TICK   # will still hit best_bid_B if available
+            buy_price_main  = best_ask_A               # safe bound
+            print(f"🔻 SELL {STOCK_B_ID} @ ≥{sell_price_dual:.2f}, BUY {STOCK_A_ID} @ {buy_price_main:.2f}")
+            resp1 = exchange.insert_order(STOCK_B_ID, price=sell_price_dual,
+                                          volume=VOLUME_PER_TRADE, side="ask", order_type="ioc")
+            resp2 = exchange.insert_order(STOCK_A_ID, price=buy_price_main,
+                                          volume=VOLUME_PER_TRADE, side="bid", order_type="ioc")
+            print("Trade responses:", resp1, resp2)
+
+    else:
+        print("⏸️ No clear arbitrage this round.")
+
+    # --- PnL tracking ---
+    pnl = exchange.get_pnl()
+    if pnl is not None:
+        pnl_adj = pnl - pnl0
+        pnl_history.append(pnl_adj)
+        mean_pnl = np.mean(pnl_history)
+        std_pnl  = np.std(pnl_history) if len(pnl_history) > 1 else 0
+
+        print(f"[{elapsed/60:.2f} min] PnL={pnl_adj:.2f}, Mean={mean_pnl:.2f}, Std={std_pnl:.2f}, PosA={pos_A}, PosB={pos_B}")
+
+    time.sleep(SLEEP_SECS)
+
+print(f"✅ Finished. Run lasted {RUN_MINUTES} minutes.")
+
+# ⏸️ No clear arbitrage this round.
+# [59.98 min] PnL=129.50, Mean=62.81, Std=35.67, PosA=93, PosB=-94
+
