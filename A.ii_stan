@@ -1,0 +1,171 @@
+import datetime as dt
+import time
+import logging
+import numpy as np
+
+from optibook.synchronous_client import Exchange
+
+# ===================== SETUP =====================
+exchange = Exchange()
+exchange.connect()
+logging.getLogger("client").setLevel("ERROR")
+
+# ===================== CONFIG =====================
+POSITION_LIMIT   = 100
+VOLUME_PER_TRADE = 1
+SLEEP_SECS       = 2
+RUN_MINUTES      = 60     # single run duration in minutes
+
+STOCK_MAIN = "ASML"
+STOCK_DUAL = "ASML_DUAL"
+
+# ===================== TRACKING =====================
+failed_trades = 0
+successful_trades = 0
+pnl_history = []
+
+# ===================== HELPER: UNWIND =====================
+def close_position(instrument_id, qty):
+    if qty == 0:
+        return
+    book = exchange.get_last_price_book(instrument_id)
+    if not book:
+        print(f"No book available for {instrument_id}, cannot unwind.")
+        return
+    
+    if qty > 0 and book.bids:  # long -> sell at bid
+        best_bid = book.bids[0].price
+        print(f"Selling {qty} {instrument_id} @ {best_bid:.2f} to close long.")
+        exchange.insert_order(
+            instrument_id=instrument_id,
+            price=best_bid,
+            volume=qty,
+            side="ask",
+            order_type="ioc",
+        )
+    elif qty < 0 and book.asks:  # short -> buy at ask
+        best_ask = book.asks[0].price
+        volume = abs(qty)
+        print(f"Buying {volume} {instrument_id} @ {best_ask:.2f} to cover short.")
+        exchange.insert_order(
+            instrument_id=instrument_id,
+            price=best_ask,
+            volume=volume,
+            side="bid",
+            order_type="ioc",
+        )
+
+# ===================== RUN =====================
+pnl0 = exchange.get_pnl()
+loop_start = time.time()
+
+print(f"📂 Starting single run for {RUN_MINUTES} minutes...")
+
+while True:
+    now = time.time()
+    elapsed = now - loop_start
+    if elapsed > RUN_MINUTES * 60:
+        print("\n⏹️ Time limit reached, stopping loop.")
+        break
+
+    pnl = exchange.get_pnl()
+    if pnl is not None:
+        pnl_adj = pnl - pnl0
+        pnl_history.append(pnl_adj)
+
+        mean_pnl = np.mean(pnl_history)
+        std_pnl  = np.std(pnl_history) if len(pnl_history) > 1 else 0
+
+    # Order books
+    book_main = exchange.get_last_price_book(STOCK_MAIN)
+    book_dual = exchange.get_last_price_book(STOCK_DUAL)
+
+    if not (book_main and book_main.bids and book_main.asks and
+            book_dual and book_dual.bids and book_dual.asks):
+        print("⚠️ Order book incomplete, skipping iteration.")
+        time.sleep(SLEEP_SECS)
+        continue
+
+    best_bid_main, best_ask_main = book_main.bids[0].price, book_main.asks[0].price
+    best_bid_dual, best_ask_dual = book_dual.bids[0].price, book_dual.asks[0].price
+
+    positions = exchange.get_positions()
+    pos_main = positions[STOCK_MAIN]
+    pos_dual = positions[STOCK_DUAL]
+
+    # ----------- IOC TRADING STRATEGY -----------
+    if best_bid_main > best_ask_dual:
+        if pos_dual + VOLUME_PER_TRADE <= POSITION_LIMIT and pos_main - VOLUME_PER_TRADE >= -POSITION_LIMIT:
+            print(f"🚀 Arbitrage: BUY {STOCK_DUAL} @ {best_ask_dual:.2f}, SELL {STOCK_MAIN} @ {best_bid_main:.2f}")
+            resp1 = exchange.insert_order(STOCK_DUAL, price=best_ask_dual,
+                                          volume=VOLUME_PER_TRADE, side="bid", order_type="ioc")
+            resp2 = exchange.insert_order(STOCK_MAIN, price=best_bid_main,
+                                          volume=VOLUME_PER_TRADE, side="ask", order_type="ioc")
+            if not resp1.success or not resp2.success:
+                failed_trades += 1
+            else:
+                successful_trades += 1
+
+    elif best_ask_main < best_bid_dual:
+        if pos_dual - VOLUME_PER_TRADE >= -POSITION_LIMIT and pos_main + VOLUME_PER_TRADE <= POSITION_LIMIT:
+            print(f"🔻 Arbitrage: SELL {STOCK_DUAL} @ {best_bid_dual:.2f}, BUY {STOCK_MAIN} @ {best_ask_main:.2f}")
+            resp1 = exchange.insert_order(STOCK_DUAL, price=best_bid_dual,
+                                          volume=VOLUME_PER_TRADE, side="ask", order_type="ioc")
+            resp2 = exchange.insert_order(STOCK_MAIN, price=best_ask_main,
+                                          volume=VOLUME_PER_TRADE, side="bid", order_type="ioc")
+            if not resp1.success or not resp2.success:
+                failed_trades += 1
+            else:
+                successful_trades += 1
+    else:
+        print("⏸️ No arbitrage opportunity this round.")
+
+    # ----------- REPORT STATUS -----------
+    if pnl is not None:
+        print(f"[{elapsed/60:.2f} min] PnL={pnl_adj:.2f}, Mean={mean_pnl:.2f}, Std={std_pnl:.2f}, "
+              f"PosMain={pos_main}, PosDual={pos_dual}, Success={successful_trades}, Failed={failed_trades}")
+
+    time.sleep(SLEEP_SECS)
+
+# ===================== SUMMARY BEFORE UNWIND =====================
+final_pnl = pnl_history[-1] if pnl_history else 0
+final_mean = np.mean(pnl_history) if pnl_history else 0
+final_std  = np.std(pnl_history) if pnl_history else 0
+
+print("\n=== RUN SUMMARY (before unwind) ===")
+print(f"Final PnL change: {final_pnl:.2f}")
+print(f"Mean PnL: {final_mean:.2f}, Std: {final_std:.2f}")
+print(f"Trades - Successful: {successful_trades}, Failed: {failed_trades}")
+
+# ===================== UNWIND =====================
+print("\n=== UNWINDING POSITIONS ===")
+positions_after_run = exchange.get_positions()
+for instr, qty in positions_after_run.items():
+    if qty != 0:
+        close_position(instr, qty)
+print("All positions attempted to unwind.\n")
+
+print("✅ Single run completed.")
+
+# >>> print("\n=== RUN SUMMARY (before unwind) ===") 
+# === RUN SUMMARY (before unwind) ===
+# >>> print(f"Final PnL change: {final_pnl:.2f}")
+# Final PnL change: 260.70
+# >>> print(f"Mean PnL: {final_mean:.2f}, Std: {final_std:.2f}")
+# Mean PnL: 118.64, Std: 62.56
+# >>> print(f"Trades - Successful: {successful_trades}, Failed: {failed_trades}")
+# Trades - Successful: 525, Failed: 0
+# >>> # ===================== UNWIND =====================
+# >>> 
+# >>> print("\n=== UNWINDING POSITIONS ===")
+
+# === UNWINDING POSITIONS ===
+# >>> positions_after_run = exchange.get_positions()
+# >>> for instr, qty in positions_after_run.items():
+# ...     if qty != 0:
+# ...         close_position(instr, qty)
+# ... 
+# Selling 85 ASML @ 78.70 to close long.
+# Buying 84 ASML_DUAL @ 78.30 to cover short.
+# >>> print("All positions attempted to unwind.\n")
+# All positions attempted to unwind.
