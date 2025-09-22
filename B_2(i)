@@ -1,0 +1,219 @@
+import datetime as dt
+import time
+import math
+import random
+import logging
+from statistics import mean, stdev
+import matplotlib
+matplotlib.use("Agg")
+import matplotlib.pyplot as plt
+import csv
+from optibook.synchronous_client import Exchange
+
+exchange = Exchange()
+exchange.connect()
+logging.getLogger("client").setLevel("ERROR")
+
+STOCK_ID = "ASML"
+FUT_ID = "ASML_FUT"
+R = 0.03
+TAU0 = 0.5
+TICK = 0.10
+SLIP_FUT = 1
+SLIP_STK = 1
+SLEEP_S = 0.5
+MAX_STOCK = 100
+MAX_FUT = 100
+FUT_SIZE = 1
+STOCK_STEP = 1
+CLEAR_RETRIES = 200
+START_TS = dt.datetime.utcnow()
+
+pnl_series = []
+baseline_pnl = None
+
+def trade_would_breach_position_limit(instrument_id, volume, side, position_limit=100):
+    positions = exchange.get_positions()
+    p = positions.get(instrument_id, 0)
+    if volume <= 0:
+        return True
+    if side == "bid":
+        return p + volume > position_limit
+    elif side == "ask":
+        return p - volume < -position_limit
+    else:
+        return True
+
+def print_positions_and_pnl(always_display=None, baseline=0.0):
+    positions = exchange.get_positions()
+    print("Positions:")
+    for instrument_id in positions:
+        if (not always_display or instrument_id in always_display or positions[instrument_id] != 0):
+            print(f"  {instrument_id:20s}: {positions[instrument_id]:4.0f}")
+    pnl = exchange.get_pnl()
+    if pnl is not None:
+        print(f"\nAdjusted PnL: {pnl - baseline:.2f}")
+
+def remaining_tau_years():
+    elapsed_s = (dt.datetime.utcnow() - START_TS).total_seconds()
+    year_s = 365.0 * 24.0 * 3600.0
+    tau = max(0.0, TAU0 - elapsed_s / year_s)
+    return tau
+
+def flatten_positions():
+    for _ in range(CLEAR_RETRIES):
+        stk = exchange.get_last_price_book(STOCK_ID)
+        fut = exchange.get_last_price_book(FUT_ID)
+        if not (stk and stk.bids and stk.asks and fut and fut.bids and fut.asks):
+            break
+        pos = exchange.get_positions()
+        ps = int(pos.get(STOCK_ID, 0))
+        pf = int(pos.get(FUT_ID, 0))
+        if ps == 0 and pf == 0:
+            break
+        if pf > 0:
+            price = fut.bids[0].price - SLIP_FUT * TICK
+            if not trade_would_breach_position_limit(FUT_ID, min(pf, FUT_SIZE), "ask", MAX_FUT):
+                exchange.insert_order(FUT_ID, price=price, volume=min(pf, FUT_SIZE), side="ask", order_type="ioc")
+        elif pf < 0:
+            price = fut.asks[0].price + SLIP_FUT * TICK
+            if not trade_would_breach_position_limit(FUT_ID, min(-pf, FUT_SIZE), "bid", MAX_FUT):
+                exchange.insert_order(FUT_ID, price=price, volume=min(-pf, FUT_SIZE), side="bid", order_type="ioc")
+        if ps > 0:
+            price = stk.bids[0].price - SLIP_STK * TICK
+            if not trade_would_breach_position_limit(STOCK_ID, min(ps, STOCK_STEP), "ask", MAX_STOCK):
+                exchange.insert_order(STOCK_ID, price=price, volume=min(ps, STOCK_STEP), side="ask", order_type="ioc")
+        elif ps < 0:
+            price = stk.asks[0].price + SLIP_STK * TICK
+            if not trade_would_breach_position_limit(STOCK_ID, min(-ps, STOCK_STEP), "bid", MAX_STOCK):
+                exchange.insert_order(STOCK_ID, price=price, volume=min(-ps, STOCK_STEP), side="bid", order_type="ioc")
+        time.sleep(0.05)
+
+def write_reports():
+    if not pnl_series:
+        print("No PnL observations collected.")
+        return
+    m = mean(pnl_series)
+    s = stdev(pnl_series) if len(pnl_series) > 1 else 0.0
+    print("\nB2(i) Performance Report")
+    print(f"Observations: {len(pnl_series)}")
+    print(f"PnL mean:     {m:.4f}")
+    print(f"PnL stdev:    {s:.4f}")
+    plt.figure()
+    plt.plot(pnl_series)
+    plt.title("PnL over time (Adjusted to start at 0) — Futures Hedged (1-lot)")
+    plt.xlabel("Iteration")
+    plt.ylabel("PnL")
+    plt.grid(True)
+    plt.savefig("pnl_series_B2i.png", dpi=150, bbox_inches="tight")
+    with open("pnl_series_B2i.csv", "w", newline="") as f:
+        w = csv.writer(f)
+        w.writerow(["Iteration", "AdjustedPnL"])
+        for i, v in enumerate(pnl_series, 1):
+            w.writerow([i, v])
+    print("Saved: pnl_series_B2i.png, pnl_series_B2i.csv")
+
+flatten_positions()
+
+try:
+    while True:
+        print("")
+        print("-----------------------------------------------------------------")
+        print(f"TRADE LOOP ITERATION ENTERED AT {str(dt.datetime.now()):18s} UTC.")
+        print("-----------------------------------------------------------------")
+
+        if baseline_pnl is None:
+            first = exchange.get_pnl()
+            if first is not None:
+                baseline_pnl = first
+
+        cur = exchange.get_pnl()
+        if cur is not None and baseline_pnl is not None:
+            pnl_series.append(float(cur - baseline_pnl))
+
+        print_positions_and_pnl(always_display=[STOCK_ID, FUT_ID], baseline=baseline_pnl or 0.0)
+        print("")
+
+        stk_book = exchange.get_last_price_book(STOCK_ID)
+        fut_book = exchange.get_last_price_book(FUT_ID)
+        if not (stk_book and stk_book.bids and stk_book.asks and fut_book and fut_book.bids and fut_book.asks):
+            print("One or both order books empty; skipping iteration.")
+            time.sleep(SLEEP_S)
+            continue
+
+        sbid = stk_book.bids[0].price
+        sask = stk_book.asks[0].price
+        fbid = fut_book.bids[0].price
+        fask = fut_book.asks[0].price
+
+        tau = remaining_tau_years()
+        hedge_ratio = math.exp(R * tau)
+
+        positions = exchange.get_positions()
+        pos_s = int(positions.get(STOCK_ID, 0))
+        pos_f = int(positions.get(FUT_ID, 0))
+
+        if random.random() > 0.5:
+            fut_side = "bid"
+            fut_price = fask + SLIP_FUT * TICK
+            if not trade_would_breach_position_limit(FUT_ID, FUT_SIZE, fut_side, MAX_FUT):
+                print(f"Insert {fut_side} {FUT_ID}: {FUT_SIZE} @ {fut_price:.2f}")
+                exchange.insert_order(FUT_ID, price=fut_price, volume=FUT_SIZE, side=fut_side, order_type="ioc")
+        else:
+            fut_side = "ask"
+            fut_price = fbid - SLIP_FUT * TICK
+            if not trade_would_breach_position_limit(FUT_ID, FUT_SIZE, fut_side, MAX_FUT):
+                print(f"Insert {fut_side} {FUT_ID}: {FUT_SIZE} @ {fut_price:.2f}")
+                exchange.insert_order(FUT_ID, price=fut_price, volume=FUT_SIZE, side=fut_side, order_type="ioc")
+
+        positions = exchange.get_positions()
+        pos_s = int(positions.get(STOCK_ID, 0))
+        pos_f = int(positions.get(FUT_ID, 0))
+
+        target_s = -pos_f * hedge_ratio
+        need = target_s - pos_s
+
+        if need > 0:
+            vol = min(STOCK_STEP, MAX_STOCK - pos_s)
+            if vol > 0 and not trade_would_breach_position_limit(STOCK_ID, vol, "bid", MAX_STOCK):
+                stk_price = sask + SLIP_STK * TICK
+                print(f"Hedge insert bid {STOCK_ID}: {vol} @ {stk_price:.2f}")
+                exchange.insert_order(STOCK_ID, price=stk_price, volume=vol, side="bid", order_type="ioc")
+        elif need < 0:
+            vol = min(STOCK_STEP, MAX_STOCK + pos_s)
+            if vol > 0 and not trade_would_breach_position_limit(STOCK_ID, vol, "ask", MAX_STOCK):
+                stk_price = sbid - SLIP_STK * TICK
+                print(f"Hedge insert ask {STOCK_ID}: {vol} @ {stk_price:.2f}")
+                exchange.insert_order(STOCK_ID, price=stk_price, volume=vol, side="ask", order_type="ioc")
+
+        time.sleep(SLEEP_S)
+
+except KeyboardInterrupt:
+    print("\nStopping…")
+
+if pnl_series:
+    pnl_mean = mean(pnl_series)
+    pnl_std = stdev(pnl_series) if len(pnl_series) > 1 else 0.0
+    print("\nB2(i) Performance Report")
+    print(f"Observations: {len(pnl_series)}")
+    print(f"PnL mean:     {pnl_mean:.4f}")
+    print(f"PnL stdev:    {pnl_std:.4f}")
+
+    plt.figure()
+    plt.plot(pnl_series)
+    plt.title("PnL over time (Adjusted to start at 0) — Futures Hedged (1-lot)")
+    plt.xlabel("Iteration")
+    plt.ylabel("PnL")
+    plt.grid(True)
+    out_path = "pnl_series_B2i.png"
+    plt.savefig(out_path, dpi=150, bbox_inches="tight")
+    print(f"Saved PnL plot to {out_path}")
+
+    with open("pnl_series_B2i.csv", "w", newline="") as f:
+        w = csv.writer(f)
+        w.writerow(["Iteration", "AdjustedPnL"])
+        for i, v in enumerate(pnl_series, 1):
+            w.writerow([i, v])
+    print("Saved PnL samples to pnl_series.csv")
+else:
+    print("No PnL observations collected.")
