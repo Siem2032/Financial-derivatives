@@ -121,6 +121,47 @@ while True:
                                       volume=lots_to_trade, side="ask", order_type="ioc")
                 print(f"Opened {lots_to_trade} lots: SELL stock, BUY future")
 
+        
+            # --- DYNAMIC HEDGE ADJUSTMENT LOOP ---
+    while True:
+        positions = exchange.get_positions()
+        stock_pos = positions.get("ASML", 0)
+        future_pos = positions.get("ASML_202512_F", 0)
+
+    # Compute net exposure: long stock + long futures = net exposure
+        hedge_diff = stock_pos + future_pos  # note the plus here!
+
+        if hedge_diff == 0:
+            print("Stock and futures positions are correctly hedged.")
+            break  # already hedged
+
+        if hedge_diff > 0:
+        # Too much net long exposure → sell stocks
+            max_stock_sell = max_lots_allowed("ASML", "ask")
+            sell_volume = min(hedge_diff, max_stock_sell)
+            if sell_volume == 0:
+                print("Cannot sell more stock due to position limits.")
+                break
+            exchange.insert_order("ASML", price=stock_book.bids[0].price,
+                              volume=sell_volume, side="ask", order_type="ioc")
+            print(f"Hedge adjustment: SOLD {sell_volume} stock to reduce net exposure")
+
+        else:
+        # Too much net short exposure → buy stocks
+            max_stock_buy = max_lots_allowed("ASML", "bid")
+            buy_volume = min(-hedge_diff, max_stock_buy)
+            if buy_volume == 0:
+                print("Cannot buy more stock due to position limits.")
+                break
+            exchange.insert_order("ASML", price=stock_book.asks[0].price,
+                              volume=buy_volume, side="bid", order_type="ioc")
+            print(f"Hedge adjustment: BOUGHT {buy_volume} stock to reduce net exposure")
+
+        time.sleep(0.1)
+
+    # Optional: small delay to allow orders to fill
+    
+
     else:
         print("No significant mispricing. Waiting for next opportunity.")
 
@@ -128,3 +169,6 @@ while True:
 
 
 #%%
+exchange.insert_order("ASML_202512_F", price= exchange.get_last_price_book("ASML_202512_F").bids[0].price, volume= 41, side="ask", order_type="ioc")
+
+# %%
