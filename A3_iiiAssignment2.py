@@ -258,7 +258,7 @@ def hedge_delta_position(stock_id, options, stock_value):
         print("No market data. Cannot hedge.")
         return
 
-    TINY_TICK = 0.05
+    TINY_TICK = 0.1
 
     # ---- 5) Place IOC order on a a price likely to directly result in a trade ----
     if delta_trade > 0:
