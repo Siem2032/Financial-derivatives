@@ -1,0 +1,200 @@
+import datetime as dt
+import time
+import logging
+import os
+import csv
+
+from optibook.synchronous_client import Exchange
+from optibook.common_types import InstrumentType, OptionKind
+from math import floor, ceil
+
+# region setup
+import sys
+import subprocess
+
+def install_and_import(package):
+    try:
+        __import__(package)
+    except ImportError:
+        subprocess.check_call([sys.executable, "-m", "pip", "install", package])
+    finally:
+        globals()[package] = __import__(package)
+
+install_and_import("scipy")
+sys.path.append("/home/workspace/your_optiver_workspace")
+# endregion
+
+from common.black_scholes import call_value, put_value, call_delta, put_delta
+from common.libs import calculate_current_time_to_date
+
+exchange = Exchange()
+exchange.connect()
+logging.getLogger("client").setLevel("ERROR")
+
+# ------------------ CSV Setup ------------------ #
+csv_file = "A3_iii_delta_hedge_log.csv"
+write_header = not os.path.exists(csv_file)
+fields = [
+    "iteration", "timestamp", "stock_value",
+    "option_id", "theoretical_value", "bid_price", "ask_price",
+    "bid_volume", "ask_volume", "option_position", "option_delta",
+    "total_portfolio_delta", "stock_position",
+    "hedge_side", "hedge_volume", "hedge_price"
+]
+
+# ------------------ Helper Functions ------------------ #
+def round_down_to_tick(price, tick_size):
+    return floor(price / tick_size) * tick_size
+
+def round_up_to_tick(price, tick_size):
+    return ceil(price / tick_size) * tick_size
+
+def get_midpoint_value(instrument_id):
+    order_book = exchange.get_last_price_book(instrument_id=instrument_id)
+    if not (order_book and order_book.bids and order_book.asks):
+        return None
+    return (order_book.bids[0].price + order_book.asks[0].price) / 2.0
+
+def calculate_theoretical_option_value(expiry, strike, option_kind, stock_value, interest_rate, volatility):
+    T = calculate_current_time_to_date(expiry)
+    if option_kind == OptionKind.CALL:
+        return call_value(S=stock_value, K=strike, T=T, r=interest_rate, sigma=volatility)
+    elif option_kind == OptionKind.PUT:
+        return put_value(S=stock_value, K=strike, T=T, r=interest_rate, sigma=volatility)
+
+def calculate_option_delta(expiry, strike, option_kind, stock_value, interest_rate, volatility):
+    T = calculate_current_time_to_date(expiry)
+    if option_kind == OptionKind.CALL:
+        return call_delta(S=stock_value, K=strike, T=T, r=interest_rate, sigma=volatility)
+    elif option_kind == OptionKind.PUT:
+        return put_delta(S=stock_value, K=strike, T=T, r=interest_rate, sigma=volatility)
+
+def update_quotes(option_id, theoretical_price, credit, volume, position_limit, tick_size):
+    trades = exchange.poll_new_trades(instrument_id=option_id)
+    for trade in trades:
+        print(f"- Last period, traded {trade.volume} lots in {option_id} at price {trade.price:.2f}, side {trade.side}.")
+    orders = exchange.get_outstanding_orders(instrument_id=option_id)
+    for order_id, order in orders.items():
+        print(f"- Deleting old {order.side} order in {option_id} for {order.volume} @ {order.price:8.2f}.")
+        exchange.delete_order(instrument_id=option_id, order_id=order_id)
+    bid_price = round_down_to_tick(theoretical_price - credit, tick_size)
+    ask_price = round_up_to_tick(theoretical_price + credit, tick_size)
+    position = exchange.get_positions()[option_id]
+    max_bid_vol = position_limit - position
+    max_ask_vol = position_limit + position
+    bid_volume = min(volume, max_bid_vol)
+    ask_volume = min(volume, max_ask_vol)
+    if bid_volume > 0:
+        print(f"- Inserting bid limit order in {option_id} for {bid_volume} @ {bid_price:8.2f}.")
+        exchange.insert_order(option_id, bid_price, bid_volume, side="bid", order_type="limit")
+    if ask_volume > 0:
+        print(f"- Inserting ask limit order in {option_id} for {ask_volume} @ {ask_price:8.2f}.")
+        exchange.insert_order(option_id, ask_price, ask_volume, side="ask", order_type="limit")
+
+def hedge_delta_position(stock_id, options, stock_value):
+    positions = exchange.get_positions()
+    total_delta = 0.0
+    option_deltas = {}
+    for option_id, option in options.items():
+        pos = positions.get(option_id, 0)
+        if pos == 0: continue
+        delta = calculate_option_delta(option.expiry, option.strike, option.option_kind,
+                                       stock_value, 0.03, 3.0)
+        total_delta += delta * pos
+        option_deltas[option_id] = delta
+        print(f"Option {option_id}: delta={delta:.4f}, position={pos}, delta*position={delta*pos:.4f}")
+    print(f"Total portfolio delta (options): {total_delta:.4f}")
+    stock_position = positions.get(stock_id, 0)
+    print(f"- Stock position: {stock_position}")
+    desired_stock_pos = max(-100, min(100, -total_delta))
+    delta_trade = desired_stock_pos - stock_position
+    hedge_trade = {"side": None, "volume": 0, "price": 0}
+    book = exchange.get_last_price_book(stock_id)
+    if abs(delta_trade) >= 1 and book and book.bids and book.asks:
+        trade_vol = abs(int(delta_trade))
+        TINY_TICK = 0.1
+        if delta_trade > 0:
+            price = book.asks[0].price + TINY_TICK
+            exchange.insert_order(stock_id, price, trade_vol, side="bid", order_type="ioc")
+            hedge_trade = {"side": "bid", "volume": trade_vol, "price": price}
+            print(f"Placing IOC bid: {trade_vol} shares at {price:.2f}")
+        else:
+            price = book.bids[0].price - TINY_TICK
+            exchange.insert_order(stock_id, price, trade_vol, side="ask", order_type="ioc")
+            hedge_trade = {"side": "ask", "volume": trade_vol, "price": price}
+            print(f"Placing IOC ask: {trade_vol} shares at {price:.2f}")
+    else:
+        print("Delta near zero or limited. No hedge needed.")
+    return total_delta, stock_position, hedge_trade, option_deltas
+
+def load_instruments_for_underlying(stock_id):
+    all_inst = exchange.get_instruments()
+    stock = all_inst[stock_id]
+    options = {iid: inst for iid, inst in all_inst.items()
+               if inst.instrument_type == InstrumentType.STOCK_OPTION and inst.base_instrument_id == stock_id}
+    return stock, options
+
+# ------------------ Main Loop ------------------ #
+STOCK_ID = "ASML"
+stock, options = load_instruments_for_underlying(STOCK_ID)
+
+run = 0
+write_header_flag = write_header
+
+while True:
+    run += 1
+    now = dt.datetime.utcnow()
+    print(f"\n--- TRADE LOOP ITERATION {run} at {now} UTC ---")
+
+    stock_value = get_midpoint_value(STOCK_ID)
+    if stock_value is None:
+        print("Stock order book empty, skipping iteration.")
+        time.sleep(4)
+        continue
+
+    positions = exchange.get_positions()
+    total_delta, stock_pos, hedge_trade, option_deltas = hedge_delta_position(STOCK_ID, options, stock_value)
+
+    with open(csv_file, "a", newline="") as f:
+        writer = csv.DictWriter(f, fieldnames=fields)
+        if write_header_flag:
+            writer.writeheader()
+            write_header_flag = False
+
+        for option_id, option in options.items():
+            option_pos = positions.get(option_id, 0)
+            theoretical = calculate_theoretical_option_value(option.expiry, option.strike,
+                                                             option.option_kind, stock_value, 0.03, 3.0)
+            bid_price = round_down_to_tick(theoretical - 0.15, 0.10)
+            ask_price = round_up_to_tick(theoretical + 0.15, 0.10)
+            bid_vol = min(3, 100 - option_pos)
+            ask_vol = min(3, 100 + option_pos)
+            writer.writerow({
+                "iteration": run,
+                "timestamp": now.strftime("%Y-%m-%d %H:%M:%S"),
+                "stock_value": stock_value,
+                "option_id": option_id,
+                "theoretical_value": theoretical,
+                "bid_price": bid_price,
+                "ask_price": ask_price,
+                "bid_volume": bid_vol,
+                "ask_volume": ask_vol,
+                "option_position": option_pos,
+                "option_delta": option_deltas.get(option_id, 0),
+                "total_portfolio_delta": total_delta,
+                "stock_position": stock_pos,
+                "hedge_side": hedge_trade["side"],
+                "hedge_volume": hedge_trade["volume"],
+                "hedge_price": hedge_trade["price"]
+            })
+        f.flush()
+
+    # Update quotes for options
+    for option_id, option in options.items():
+        update_quotes(option_id, calculate_theoretical_option_value(option.expiry, option.strike,
+                     option.option_kind, stock_value, 0.03, 3.0),
+                     credit=0.15, volume=3, position_limit=100, tick_size=0.10)
+        time.sleep(0.20)
+
+    print(f"Iteration {run} logged. Sleeping 4 seconds.")
+    time.sleep(4)
