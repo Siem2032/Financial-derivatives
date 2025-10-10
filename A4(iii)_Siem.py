@@ -249,6 +249,26 @@ def load_instruments_for_underlying(underlying_stock_id):
     }
     return stock, options
 
+def compute_portfolio_value(stock_id, options):
+    """Compute current mark-to-market portfolio value."""
+    positions = exchange.get_positions()
+    total_value = 0.0
+
+    # Stock
+    stock_pos = positions.get(stock_id, 0)
+    stock_mid = get_midpoint_value(stock_id)
+    if stock_mid:
+        total_value += stock_pos * stock_mid
+
+    # Options
+    for option_id, option in options.items():
+        pos = positions.get(option_id, 0)
+        mid = get_midpoint_value(option_id)
+        if mid:
+            total_value += pos * mid
+
+    return total_value
+    
 # ---------- main ----------
 STOCK_ID = "ASML"
 stock, options = load_instruments_for_underlying(STOCK_ID)
@@ -256,6 +276,33 @@ stock, options = load_instruments_for_underlying(STOCK_ID)
 # A4(iii): trade ALL listed ASML options (no maturity filter)
 print(f"- Trading ALL {len(options)} ASML options.")
 
+import numpy as np
+import csv
+import os
+
+# --- Performance tracking ---
+pnl_history = []           # stores (timestamp, gain)
+iteration_pnl = []         # gain per iteration
+last_value = None          # last MTM portfolio value
+
+# Create CSV file with headers if not exists
+csv_filename = "A4_iii.csv"
+if not os.path.exists(csv_filename):
+    with open(csv_filename, "w", newline="") as f:
+        writer = csv.writer(f)
+        writer.writerow([
+            "timestamp",
+            "hourly_pnl",
+            "hourly_pnl_std",
+            "avg_gain_per_iter",
+            "std_gain_per_iter",
+            "sharpe_ratio_hourly",
+            "total_delta",
+            "option_delta",
+            "stock_position",
+            "portfolio_value"
+        ])
+        
 last_credit = {}
 fills = 0
 edge_sum = 0.0
@@ -346,5 +393,66 @@ while True:
     print(f"Avg |total Δ|: {delta_abs_sum/max(1,loops):.2f}")
     print("================================")
 
+   # === PERFORMANCE & RISK LOGGING ===
+    current_value = compute_portfolio_value(STOCK_ID, options)
+    now = dt.datetime.utcnow()
+
+    if last_value is not None:
+        gain = current_value - last_value
+        iteration_pnl.append(gain)
+        pnl_history.append((now, gain))
+
+        # --- Hourly window ---
+        one_hour_ago = now - dt.timedelta(hours=1)
+        hourly_gains = [g for t, g in pnl_history if t >= one_hour_ago]
+        hourly_pnl = sum(hourly_gains)
+        hourly_std = np.std(hourly_gains) if len(hourly_gains) > 1 else 0.0
+
+        # --- Iteration-level stats ---
+        avg_gain = np.mean(iteration_pnl)
+        std_gain = np.std(iteration_pnl)
+        sharpe = (np.mean(hourly_gains) / np.std(hourly_gains)) if len(hourly_gains) > 1 and np.std(hourly_gains) > 0 else 0.0
+
+        # --- Delta & positions ---
+        positions = exchange.get_positions()
+        total_delta_now, stock_pos_now, delta_breakdown = compute_total_delta(
+            stock_id=STOCK_ID, options=options, stock_value=stock_value
+        )
+
+        # Calculate option delta (sum of option position * option delta)
+        option_delta = sum(contrib for _, _, _, contrib in delta_breakdown)
+
+        # --- Print to console ---
+        print("\n===== PERFORMANCE METRICS =====")
+        print(f"Timestamp: {now}")
+        print(f"Hourly PnL: {hourly_pnl:.2f}")
+        print(f"Hourly PnL StdDev: {hourly_std:.2f}")
+        print(f"Avg Gain/Iter: {avg_gain:.4f}")
+        print(f"Std Gain/Iter: {std_gain:.4f}")
+        print(f"Sharpe Ratio (hourly): {sharpe:.3f}")
+        print(f"Total Δ: {total_delta_now:+.2f}")
+        print(f"Option Δ: {option_delta:+.2f}")
+        print(f"Stock Position: {stock_pos_now:+d}")
+        print(f"Portfolio Value: {current_value:.2f}")
+        print("================================")
+
+        # --- Write to CSV ---
+        with open(csv_filename, "a", newline="") as f:
+            writer = csv.writer(f)
+            writer.writerow([
+                now,
+                hourly_pnl,
+                hourly_std,
+                avg_gain,
+                std_gain,
+                sharpe,
+                total_delta_now,
+                option_delta,
+                stock_pos_now,
+                current_value
+            ])
+
+    last_value = current_value
+    
     print("\nSleeping for 4 seconds.")
     time.sleep(4)
